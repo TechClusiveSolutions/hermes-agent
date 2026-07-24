@@ -58,6 +58,47 @@ The full set of keys:
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 
+### Approval Delegation for Headless Sessions {#approval-delegation-for-headless-sessions}
+
+Headless triggers — currently [webhook](./messaging/webhooks.md) sessions — have no interactive chat window for a human to answer an `approvals.mode: smart` prompt through. By default, that means an ambiguous command in a headless session just hangs for the approval `timeout` and then fails closed (denied) — nobody is ever asked. This is the safe default and requires no configuration.
+
+If you'd rather give a human a real chance to approve a headless session's ambiguous commands — instead of a guaranteed denial every time — you can opt a session into **approval delegation**: the pending-command prompt is forwarded to a real interactive platform (e.g. Slack) and resolved there through that platform's own existing approve/deny mechanism (interactive buttons where the platform's adapter supports them, a plain-text `/approve`/`/deny` prompt otherwise) — the exact same mechanism already used for that platform's native chat sessions.
+
+```yaml
+approvals:
+  delegate: "slack:C0B8JK868SX"        # optional global default delegate target
+  headless_timeout_seconds: 900        # optional global default: how long a delegated approval waits for a reply
+```
+
+| Key | Default | What it controls |
+|---|---|---|
+| `delegate` | *(unset)* | Global default delegate target, format `"<platform>:<chat-or-channel-id>"` (e.g. `"slack:C0B8JK868SX"`). Applies to any headless route that doesn't set its own delegate. |
+| `headless_timeout_seconds` | *(unset — falls back to `approvals.timeout`)* | Global default for how long a delegated approval waits for a human reply before falling back to fail-closed denial. A human responding via a delegate platform typically needs longer than the ordinary `approvals.timeout` (300s default) — pushes may not be seen for a couple of minutes. |
+
+For webhooks specifically, both are also configurable **per route**, overriding the global default — see the `approval_delegate` / `approval_delegate_timeout_seconds` [route properties](./messaging/webhooks.md#configuring-routes):
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        github:
+          secret: "..."
+          approval_delegate: "slack:C0B8JK868SX"
+          approval_delegate_timeout_seconds: 900
+```
+
+**What delegation does *not* change**:
+
+- **Nothing is enabled by default.** No `delegate` configured (globally or per-route) means zero behavior change — the session fails closed after the timeout exactly as it always has.
+- **The Smart DENY classifier is untouched.** Delegation only ever affects the *ambiguous* bucket — commands not obviously safe (auto-approved) and not obviously dangerous (auto-denied). A genuinely dangerous command is still denied immediately, with or without a delegate configured; delegation gives a chance at approval only to commands that would otherwise just time out.
+- **Fail-closed on exhaustion, always.** If delivery to the delegate platform fails, or nobody replies within the timeout, the command is denied — same outcome as having no delegate configured at all. Delegation adds a chance to succeed; it never adds a chance to bypass denial.
+- **Authorization is not bypassed.** A delegated approval is resolved through the target platform's own existing inbound authorization (allowlist / DM pairing) — the same check a native chat approval on that platform goes through. A session_key is a routing handle, not an authorization credential in itself: knowing it grants no special rights to an unauthorized user replying on the delegate platform.
+
+:::info
+Only a single delegate target is supported per session, with a fixed fail-closed timeout. An ordered multi-platform fallback chain (e.g. "try Slack, then Discord, then a file-based pre-approval check") and any variant that resolves an unanswered prompt as *approved* rather than denied are deliberately not supported — the latter would loosen the default-deny guarantee this feature is built to preserve. Both are open ideas for a possible future, separately-designed capability, not something to reach for via unsupported config values.
+:::
+
 ### YOLO Mode
 
 YOLO mode bypasses **all** dangerous command approval prompts for the current session. It can be activated three ways:

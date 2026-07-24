@@ -87,6 +87,8 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `approval_delegate` | No | Forward this route's dangerous-command approval prompts to a real interactive platform instead of always failing closed. Format: `"<platform>:<chat-or-channel-id>"`, e.g. `"slack:C0B8JK868SX"`. Overrides the global `approvals.delegate` default for this route. See [Approval Delegation for Headless Sessions](../security.md#approval-delegation-for-headless-sessions). |
+| `approval_delegate_timeout_seconds` | No | Per-route override of how long a delegated approval waits for a reply before falling back to the default fail-closed timeout. Overrides the global `approvals.headless_timeout_seconds`. Only meaningful alongside `approval_delegate`. |
 
 ### Full example
 
@@ -503,7 +505,7 @@ This is the same trust model that applies to everything the agent reads: web pag
 
 - **Sandbox the runtime.** Run the gateway with the Docker or SSH terminal backend (or in a VM) when exposed to the internet, so a hijacked turn cannot touch the host.
 - **Scope the toolset.** Disable `terminal`, `file`, and outbound-action tools on webhook-triggered sessions if the route only needs to read and summarize. Fewer capabilities means a smaller blast radius if a payload field carries injected instructions.
-- **Keep approvals on** for any destructive or outbound operation, so an injected instruction cannot act unattended.
+- **Keep approvals on** for any destructive or outbound operation, so an injected instruction cannot act unattended. A webhook session is headless — there's no chat window for a human to answer an `approvals.mode: smart` prompt through, so by default an ambiguous command just hangs for the approval timeout and then fails closed (deny). That's the safe default; if you'd rather give a human a real chance to say yes instead of a guaranteed denial, see [Approval Delegation for Headless Sessions](../security.md#approval-delegation-for-headless-sessions).
 - **Template narrowly.** Prefer a specific `prompt` with named fields (`{pull_request.title}`) over `{__raw__}` or an empty template that dumps the whole payload, so only the fields you intend reach the prompt.
 :::
 

@@ -2009,6 +2009,18 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](/user-guide/security#user-defined-deny-rules-approvalsdeny) for details.
 
+### Approval delegation for headless sessions
+
+Headless sessions (currently [webhooks](/user-guide/messaging/webhooks#configuring-routes)) have no chat window for a human to answer a `smart`-mode prompt through, so by default an ambiguous command just fails closed after the timeout. Optionally forward those prompts to a real interactive platform instead:
+
+```yaml
+approvals:
+  delegate: "slack:C0B8JK868SX"       # optional global default, "<platform>:<chat-or-channel-id>"
+  headless_timeout_seconds: 900       # optional — longer wait than the default approvals.timeout
+```
+
+Unset by default (zero behavior change). Also overridable per webhook route via `approval_delegate` / `approval_delegate_timeout_seconds`. Never loosens the Smart DENY classifier or bypasses the target platform's own authorization, and still fails closed on timeout or delivery failure. See [Security — Approval Delegation for Headless Sessions](/user-guide/security#approval-delegation-for-headless-sessions) for the full picture.
+
 ## Checkpoints
 
 Automatic filesystem snapshots before destructive file operations. See the [Checkpoints & Rollback](/user-guide/checkpoints-and-rollback) for details.
