@@ -20,6 +20,22 @@ session originated (confirmed for Slack's adapter, which treats
 buttons and when resolving a click against
 ``tools.approval.resolve_gateway_approval``).
 
+Two details matter for correctness and are easy to get wrong:
+
+1. **The session_key must be the real gateway approval key**, i.e. whatever
+   ``gateway.session.build_session_key(source, ...)`` computes for the
+   triggering event's ``source`` — not a platform's own delivery/chat
+   identifier (e.g. a raw webhook ``chat_id``). ``tools.approval`` waits on
+   the ``build_session_key``-derived key; registering under anything else
+   means the notify_cb is never found.
+2. **The registration must be pinned** (``register_gateway_notify(...,
+   pinned=True)``). ``gateway/run.py``'s per-turn agent runner
+   unconditionally re-registers its own default (unpinned) notify_cb for
+   *every* session on *every* turn, including headless ones, moments after
+   a caller like ``gateway/platforms/webhook.py`` registers a delegate.
+   Without pinning, that later unpinned call silently overwrites the
+   delegate — no exception, the feature just quietly does nothing.
+
 Fail-closed behavior is unchanged in every case this module doesn't
 actively improve: no delegate configured, a malformed target, an
 unconnected/unknown platform, or a delivery failure all leave the session
@@ -70,17 +86,33 @@ def _resolve_delegate_target(route_config: dict, global_approvals: dict) -> Opti
 
 
 def _resolve_delegate_timeout(route_config: dict, global_approvals: dict) -> Optional[int]:
-    """Per-route override wins; else the global ``approvals.headless_timeout_seconds`` default."""
+    """Per-route override wins; else the global ``approvals.headless_timeout_seconds`` default.
+
+    Non-positive values (``0`` or negative) are treated as malformed config
+    and ignored, falling back to the global ``approvals.timeout`` default,
+    rather than being honored — a ``0``/negative override would otherwise
+    turn ``_await_gateway_decision``'s deadline math (``max(timeout, 0)``)
+    into an immediate deny with no real wait, defeating the point of
+    configuring a delegate at all.
+    """
     value = route_config.get("approval_delegate_timeout_seconds")
     if value is None:
         value = global_approvals.get("headless_timeout_seconds")
     if value is None:
         return None
     try:
-        return int(value)
+        timeout = int(value)
     except (TypeError, ValueError):
         logger.warning("Ignoring non-numeric approval delegate timeout: %r", value)
         return None
+    if timeout <= 0:
+        logger.warning(
+            "Ignoring non-positive approval delegate timeout: %r "
+            "(falling back to the global approvals.timeout default)",
+            value,
+        )
+        return None
+    return timeout
 
 
 def _get_delegate_adapter(gateway_runner: Any, platform_name: str) -> Any:
@@ -243,7 +275,16 @@ def maybe_register_delegate(
     from tools.approval import register_gateway_notify
 
     timeout_override = _resolve_delegate_timeout(route_config, global_approvals)
-    register_gateway_notify(session_key, _delegate_notify_sync, timeout_override=timeout_override)
+    # pinned=True: gateway/run.py's per-turn agent runner unconditionally
+    # re-registers its own default (unpinned) notify_cb for every session on
+    # every turn, including this one, moments after this call returns. A
+    # pinned registration refuses that overwrite (see
+    # tools.approval.register_gateway_notify's docstring) — without it, the
+    # delegate would be silently clobbered before the agent's first
+    # approval-worthy command ever runs.
+    register_gateway_notify(
+        session_key, _delegate_notify_sync, timeout_override=timeout_override, pinned=True,
+    )
     logger.info(
         "Registered approval delegate %s for session %s%s",
         target, session_key,

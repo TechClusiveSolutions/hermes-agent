@@ -129,6 +129,21 @@ class TestResolveDelegateTimeout:
         route_config = {"approval_delegate_timeout_seconds": "not-a-number"}
         assert _resolve_delegate_timeout(route_config, {}) is None
 
+    def test_zero_value_is_ignored(self):
+        """A 0 override would make _await_gateway_decision's deadline math
+        (max(timeout, 0)) deny instantly instead of waiting — must be
+        rejected as malformed config, not honored (Copilot review #2)."""
+        route_config = {"approval_delegate_timeout_seconds": 0}
+        assert _resolve_delegate_timeout(route_config, {}) is None
+
+    def test_negative_value_is_ignored(self):
+        route_config = {"approval_delegate_timeout_seconds": -30}
+        assert _resolve_delegate_timeout(route_config, {}) is None
+
+    def test_zero_global_default_is_also_ignored(self):
+        global_approvals = {"headless_timeout_seconds": 0}
+        assert _resolve_delegate_timeout({}, global_approvals) is None
+
 
 class TestGetDelegateAdapter:
     def test_finds_adapter_in_default_adapters(self):
@@ -227,6 +242,40 @@ class TestMaybeRegisterDelegateSuccess:
         assert self.SESSION_KEY in mod._gateway_notify_cbs
 
     @pytest.mark.asyncio
+    async def test_registration_is_pinned(self):
+        """A delegate registration must be pinned, or gateway/run.py's later
+        unconditional per-turn registration of its own default notify_cb
+        silently clobbers it (Copilot review #2, finding 4)."""
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {"approval_delegate": "slack:C0B8JK868SX"}
+        maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        from tools import approval as mod
+        assert self.SESSION_KEY in mod._gateway_notify_pinned
+
+    @pytest.mark.asyncio
+    async def test_pinned_registration_survives_a_later_unpinned_registration(self):
+        """Simulates gateway/run.py's per-turn _run_agent_inner call, which
+        unconditionally calls register_gateway_notify(session_key, its own
+        default cb) with no pinning, moments after this delegate registers."""
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {"approval_delegate": "slack:C0B8JK868SX"}
+        maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        from tools import approval as mod
+        delegate_cb = mod._gateway_notify_cbs[self.SESSION_KEY]
+
+        def _run_py_default_cb(approval_data):
+            raise AssertionError("the native default cb ran instead of the delegate")
+
+        mod.register_gateway_notify(self.SESSION_KEY, _run_py_default_cb)  # unpinned
+
+        assert mod._gateway_notify_cbs[self.SESSION_KEY] is delegate_cb
+        assert self.SESSION_KEY in mod._gateway_notify_pinned
+
+    @pytest.mark.asyncio
     async def test_global_default_target_is_used_when_no_route_override(self):
         adapter = _FakeButtonAdapter()
         runner = _FakeRunner(adapters={Platform.SLACK: adapter})
@@ -288,6 +337,78 @@ class TestMaybeRegisterDelegateSuccess:
 
         assert len(adapter.approval_calls) == 1  # tried the button path first
         assert len(adapter.text_calls) == 1       # then fell back to text
+
+
+# ---------------------------------------------------------------------------
+# tools.approval's pinned-registration guard (Copilot review #2, finding 4):
+# gateway/run.py's per-turn agent runner unconditionally re-registers its
+# own default (unpinned) notify_cb for every session on every turn. Without
+# pinning, that clobbers a delegate registered moments earlier — silently,
+# no exception, the feature just does nothing. These tests exercise the
+# registry directly, independent of gateway/approval_delegate.py.
+# ---------------------------------------------------------------------------
+
+class TestPinnedRegistrationGuard:
+    SESSION_KEY = "test-pinned-registration-session"
+
+    def teardown_method(self):
+        from tools import approval as mod
+        mod.unregister_gateway_notify(self.SESSION_KEY)
+
+    def test_unpinned_registration_is_pinned_false_by_default(self):
+        from tools import approval as mod
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+        assert self.SESSION_KEY not in mod._gateway_notify_pinned
+
+    def test_pinned_registration_marks_session_pinned(self):
+        from tools import approval as mod
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None, pinned=True)
+        assert self.SESSION_KEY in mod._gateway_notify_pinned
+
+    def test_unpinned_call_does_not_overwrite_a_pinned_cb(self):
+        from tools import approval as mod
+        pinned_cb = lambda data: None
+        mod.register_gateway_notify(self.SESSION_KEY, pinned_cb, pinned=True)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)  # unpinned
+        assert mod._gateway_notify_cbs[self.SESSION_KEY] is pinned_cb
+        assert self.SESSION_KEY in mod._gateway_notify_pinned
+
+    def test_unpinned_call_does_not_clear_pinned_timeout_override(self):
+        from tools import approval as mod
+        mod.register_gateway_notify(
+            self.SESSION_KEY, lambda data: None, timeout_override=900, pinned=True,
+        )
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)  # unpinned, no-op
+        assert mod._get_approval_timeout(self.SESSION_KEY) == 900
+
+    def test_pinned_call_can_overwrite_a_pinned_cb(self):
+        from tools import approval as mod
+        first_cb = lambda data: None
+        second_cb = lambda data: None
+        mod.register_gateway_notify(self.SESSION_KEY, first_cb, pinned=True)
+        mod.register_gateway_notify(self.SESSION_KEY, second_cb, pinned=True)
+        assert mod._gateway_notify_cbs[self.SESSION_KEY] is second_cb
+
+    def test_unpinned_call_overwrites_a_prior_unpinned_cb_as_before(self):
+        """Normal (non-delegate) behavior is unchanged: each turn's fresh
+        unpinned registration still wins over the previous turn's."""
+        from tools import approval as mod
+        first_cb = lambda data: None
+        second_cb = lambda data: None
+        mod.register_gateway_notify(self.SESSION_KEY, first_cb)
+        mod.register_gateway_notify(self.SESSION_KEY, second_cb)
+        assert mod._gateway_notify_cbs[self.SESSION_KEY] is second_cb
+
+    def test_unregister_clears_pinned_flag(self):
+        from tools import approval as mod
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None, pinned=True)
+        mod.unregister_gateway_notify(self.SESSION_KEY)
+        assert self.SESSION_KEY not in mod._gateway_notify_pinned
+        # A fresh unpinned registration after unregister must succeed
+        # normally — the pin from a prior (now-ended) session must not leak.
+        new_cb = lambda data: None
+        mod.register_gateway_notify(self.SESSION_KEY, new_cb)
+        assert mod._gateway_notify_cbs[self.SESSION_KEY] is new_cb
 
 
 # ---------------------------------------------------------------------------

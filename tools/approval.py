@@ -2044,9 +2044,11 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 _gateway_notify_timeouts: dict[str, int] = {}  # session_key → per-session timeout override (seconds)
+_gateway_notify_pinned: set = set()          # session_keys whose notify_cb refuses unpinned overwrite
 
 
-def register_gateway_notify(session_key: str, cb, *, timeout_override: Optional[int] = None) -> None:
+def register_gateway_notify(session_key: str, cb, *, timeout_override: Optional[int] = None,
+                            pinned: bool = False) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
@@ -2061,9 +2063,31 @@ def register_gateway_notify(session_key: str, cb, *, timeout_override: Optional[
     responding via a delegate platform realistically needs longer than the
     ~300s default. Does not change the fail-closed outcome on expiry — only
     how long the wait is.
+
+    *pinned*, if True, marks this registration as non-overwritable by a later
+    *unpinned* call for the same session_key — it silently no-ops instead
+    (the pinned cb stays registered). This exists because ``gateway/run.py``'s
+    per-turn agent runner unconditionally re-registers its own default
+    notify_cb for every session on every turn (an unpinned call); without
+    this, that later call would clobber a deliberately-configured approval
+    delegate (``gateway/approval_delegate.py``) moments after it registers,
+    silently making delegation inert. A pinned registration can still be
+    replaced by another *pinned* call (e.g. re-registering the same delegate
+    with updated data) — only unpinned callers are blocked from overwriting.
     """
     with _lock:
+        if not pinned and session_key in _gateway_notify_pinned:
+            logger.debug(
+                "register_gateway_notify: ignoring unpinned registration for "
+                "session %s — a pinned notify_cb is already registered",
+                session_key,
+            )
+            return
         _gateway_notify_cbs[session_key] = cb
+        if pinned:
+            _gateway_notify_pinned.add(session_key)
+        else:
+            _gateway_notify_pinned.discard(session_key)
         if timeout_override is not None:
             _gateway_notify_timeouts[session_key] = timeout_override
         else:
@@ -2079,6 +2103,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         _gateway_notify_timeouts.pop(session_key, None)
+        _gateway_notify_pinned.discard(session_key)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()

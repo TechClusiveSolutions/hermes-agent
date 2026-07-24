@@ -802,21 +802,6 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        # Opt-in: forward this session's ambiguous-command smart-mode
-        # approvals to a real interactive platform (e.g. Slack) instead of
-        # always failing closed after the timeout with nobody able to
-        # respond. No-op unless approval_delegate is configured (per-route
-        # here, or globally in approvals.delegate) — see
-        # gateway/approval_delegate.py for the full behavior/fail-closed
-        # guarantees.
-        from gateway.approval_delegate import maybe_register_delegate
-        maybe_register_delegate(
-            session_chat_id,
-            route_config,
-            self.gateway_runner,
-            self._get_global_approvals_config(),
-        )
-
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
@@ -841,6 +826,34 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+
+        # Opt-in: forward this session's ambiguous-command smart-mode
+        # approvals to a real interactive platform (e.g. Slack) instead of
+        # always failing closed after the timeout with nobody able to
+        # respond. No-op unless approval_delegate is configured (per-route
+        # here, or globally in approvals.delegate) — see
+        # gateway/approval_delegate.py for the full behavior/fail-closed
+        # guarantees.
+        #
+        # Registers under build_session_key(source, ...)'s output, NOT
+        # session_chat_id — that's the actual key tools.approval waits on
+        # (computed identically, moments from now, by
+        # BasePlatformAdapter.handle_message; must match byte-for-byte or
+        # the notify_cb registers under a key nothing ever looks up).
+        from gateway.approval_delegate import maybe_register_delegate
+        from gateway.session import build_session_key
+        approval_session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        maybe_register_delegate(
+            approval_session_key,
+            route_config,
+            self.gateway_runner,
+            self._get_global_approvals_config(),
+        )
+
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -903,8 +916,17 @@ class WebhookAdapter(BasePlatformAdapter):
         # (gateway/approval_delegate.py). Safe to call unconditionally even
         # if none was registered. Must happen before/alongside session close
         # so a stale notify_cb never outlives its one-shot webhook session.
+        # Must use the same build_session_key(...)-derived key computed at
+        # registration time in _handle_webhook, NOT event.source.chat_id —
+        # see the registration call site for why.
+        from gateway.session import build_session_key
         from tools.approval import unregister_gateway_notify
-        unregister_gateway_notify(event.source.chat_id)
+        approval_session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        unregister_gateway_notify(approval_session_key)
 
         await self._end_webhook_session(event, event.source.chat_id)
 
