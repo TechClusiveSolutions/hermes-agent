@@ -802,6 +802,21 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
+        # Opt-in: forward this session's ambiguous-command smart-mode
+        # approvals to a real interactive platform (e.g. Slack) instead of
+        # always failing closed after the timeout with nobody able to
+        # respond. No-op unless approval_delegate is configured (per-route
+        # here, or globally in approvals.delegate) — see
+        # gateway/approval_delegate.py for the full behavior/fail-closed
+        # guarantees.
+        from gateway.approval_delegate import maybe_register_delegate
+        maybe_register_delegate(
+            session_chat_id,
+            route_config,
+            self.gateway_runner,
+            self._get_global_approvals_config(),
+        )
+
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
@@ -884,6 +899,13 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
+        # Unregister any approval delegate registered for this session
+        # (gateway/approval_delegate.py). Safe to call unconditionally even
+        # if none was registered. Must happen before/alongside session close
+        # so a stale notify_cb never outlives its one-shot webhook session.
+        from tools.approval import unregister_gateway_notify
+        unregister_gateway_notify(event.source.chat_id)
+
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
@@ -1283,6 +1305,23 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    def _get_global_approvals_config(self) -> dict:
+        """Read the global ``approvals`` config block, e.g. for
+        ``approvals.delegate`` (see gateway/approval_delegate.py).
+
+        Mirrors the ``cfg.get("approvals")`` pattern used elsewhere in
+        ``gateway/run.py``. Never raises — returns ``{}`` on any failure so a
+        config read hiccup can never break webhook delivery, only silently
+        leave approval delegation unconfigured (its existing no-op/fail-closed
+        path).
+        """
+        try:
+            cfg = self.gateway_runner._read_user_config() if self.gateway_runner else {}
+            approvals = cfg.get("approvals") if isinstance(cfg, dict) else None
+            return approvals if isinstance(approvals, dict) else {}
+        except Exception:
+            return {}
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict

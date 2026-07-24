@@ -2043,18 +2043,31 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_notify_timeouts: dict[str, int] = {}  # session_key → per-session timeout override (seconds)
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb, *, timeout_override: Optional[int] = None) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
     *approval_data* contains ``command``, ``description``, and
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
+
+    *timeout_override*, if given, replaces the global ``approvals.timeout``
+    config value for approvals waited on under this session_key only (see
+    ``_get_approval_timeout``). Used by headless sessions with a configured
+    approval delegate (``gateway/approval_delegate.py``), where a human
+    responding via a delegate platform realistically needs longer than the
+    ~300s default. Does not change the fail-closed outcome on expiry — only
+    how long the wait is.
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        if timeout_override is not None:
+            _gateway_notify_timeouts[session_key] = timeout_override
+        else:
+            _gateway_notify_timeouts.pop(session_key, None)
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -2065,6 +2078,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_notify_timeouts.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
@@ -2490,14 +2504,25 @@ def is_approval_bypass_active() -> bool:
     )
 
 
-def _get_approval_timeout() -> int:
+def _get_approval_timeout(session_key: Optional[str] = None) -> int:
     """Read the approval timeout from config. Defaults to 300 seconds.
 
     The default matches DEFAULT_CONFIG["approvals"]["timeout"]. Gateway
     approvals arrive as push notifications the user may not see for a couple
     of minutes; 60s proved too tight in practice (Telegram taps landed after
     the wait had already failed closed).
+
+    If *session_key* has a per-session override registered (via
+    ``register_gateway_notify(..., timeout_override=...)``), that value wins
+    over the global config — e.g. a webhook session with an approval
+    delegate configured, where a human responding via Slack/Discord/etc.
+    realistically needs longer than the global default.
     """
+    if session_key is not None:
+        with _lock:
+            override = _gateway_notify_timeouts.get(session_key)
+        if override is not None:
+            return override
     try:
         return int(_get_approval_config().get("timeout", 300))
     except (ValueError, TypeError):
@@ -3119,7 +3144,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    timeout = _get_approval_timeout(session_key)
 
     try:
         from tools.environments.base import touch_activity_if_due
