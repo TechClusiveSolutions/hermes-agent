@@ -72,7 +72,7 @@ approvals:
 
 | Key | Default | What it controls |
 |---|---|---|
-| `delegate` | *(unset)* | Global default delegate target, format `"<platform>:<chat-or-channel-id>"` (e.g. `"slack:C0B8JK868SX"`). Applies to any headless route that doesn't set its own delegate. |
+| `delegate` | *(unset)* | Global default delegate target, format `"<platform>:<chat-or-channel-id>"` (e.g. `"slack:C0B8JK868SX"`). Applies to any headless route that doesn't set its own delegate — **except multiplexed `/p/<profile>/` webhook routes**, which never read the global defaults (that would leak one profile's approvals config onto another's route) and must opt in per-route instead. |
 | `headless_timeout_seconds` | *(unset — falls back to `approvals.timeout`)* | Global default for how long a delegated approval waits for a human reply before falling back to fail-closed denial. A human responding via a delegate platform typically needs longer than the ordinary `approvals.timeout` (300s default) — pushes may not be seen for a couple of minutes. |
 
 For webhooks specifically, both are also configurable **per route**, overriding the global default — see the `approval_delegate` / `approval_delegate_timeout_seconds` [route properties](./messaging/webhooks.md#configuring-routes):

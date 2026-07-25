@@ -2019,7 +2019,7 @@ approvals:
   headless_timeout_seconds: 900       # optional — longer wait than the default approvals.timeout
 ```
 
-Unset by default (zero behavior change). Also overridable per webhook route via `approval_delegate` / `approval_delegate_timeout_seconds`. Button-only (the delegate platform's adapter must support interactive approvals; "Always Allow" is never offered on a delegated prompt), never bypasses the target platform's own authorization, and still fails closed on timeout or delivery failure. Note that opting in genuinely changes the outcome for smart mode's *ambiguous* command bucket — from guaranteed timeout-deny to human-approvable — see [Security — Approval Delegation for Headless Sessions](/user-guide/security#approval-delegation-for-headless-sessions) for the full picture.
+Unset by default (zero behavior change). Also overridable per webhook route via `approval_delegate` / `approval_delegate_timeout_seconds`. Multiplexed `/p/<profile>/` webhook routes never inherit these global defaults (that would leak one profile's approvals config onto another's route) — they must set the per-route keys. Button-only (the delegate platform's adapter must support interactive approvals; "Always Allow" is never offered on a delegated prompt), never bypasses the target platform's own authorization, and still fails closed on timeout or delivery failure. Note that opting in genuinely changes the outcome for smart mode's *ambiguous* command bucket — from guaranteed timeout-deny to human-approvable — see [Security — Approval Delegation for Headless Sessions](/user-guide/security#approval-delegation-for-headless-sessions) for the full picture.
 
 ## Checkpoints
 
