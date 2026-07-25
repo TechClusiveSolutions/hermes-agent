@@ -16,6 +16,7 @@ import pytest
 from gateway.approval_delegate import (
     _get_delegate_adapter,
     _parse_delegate_target,
+    _resolve_delegate_metadata,
     _resolve_delegate_target,
     _resolve_delegate_timeout,
     maybe_register_delegate,
@@ -154,6 +155,24 @@ class TestResolveDelegateTimeout:
     def test_zero_global_default_is_also_ignored(self):
         global_approvals = {"headless_timeout_seconds": 0}
         assert _resolve_delegate_timeout({}, global_approvals) is None
+
+
+class TestResolveDelegateMetadata:
+    def test_none_when_unconfigured(self):
+        assert _resolve_delegate_metadata({}, {}) is None
+
+    def test_per_route_wins_over_global(self):
+        route_config = {"approval_delegate_metadata": {"team_id": "T-route"}}
+        global_approvals = {"delegate_metadata": {"team_id": "T-global"}}
+        assert _resolve_delegate_metadata(route_config, global_approvals) == {"team_id": "T-route"}
+
+    def test_falls_back_to_global(self):
+        global_approvals = {"delegate_metadata": {"team_id": "T-global"}}
+        assert _resolve_delegate_metadata({}, global_approvals) == {"team_id": "T-global"}
+
+    def test_non_dict_is_ignored(self):
+        assert _resolve_delegate_metadata({"approval_delegate_metadata": "T123"}, {}) is None
+        assert _resolve_delegate_metadata({"approval_delegate_metadata": ["T123"]}, {}) is None
 
 
 class TestGetDelegateAdapter:
@@ -354,6 +373,50 @@ class TestMaybeRegisterDelegateSuccess:
         )
 
         assert adapter.approval_calls[0]["allow_permanent"] is False
+
+    @pytest.mark.asyncio
+    async def test_notify_cb_forwards_configured_metadata(self):
+        """approval_delegate_metadata routes multi-workspace adapters (e.g.
+        Slack team_id) to the right scoped client."""
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {
+            "approval_delegate": "slack:C0B8JK868SX",
+            "approval_delegate_metadata": {"team_id": "T0123ABC"},
+        }
+        maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        from tools import approval as mod
+        cb = mod._gateway_notify_cbs[self.SESSION_KEY]
+        await asyncio.to_thread(cb, {"command": "ls", "description": "listing"})
+
+        assert adapter.approval_calls[0]["metadata"] == {"team_id": "T0123ABC"}
+
+    @pytest.mark.asyncio
+    async def test_notify_cb_metadata_defaults_to_none(self):
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {"approval_delegate": "slack:C0B8JK868SX"}
+        maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        from tools import approval as mod
+        cb = mod._gateway_notify_cbs[self.SESSION_KEY]
+        await asyncio.to_thread(cb, {"command": "ls", "description": "listing"})
+
+        assert adapter.approval_calls[0]["metadata"] is None
+
+    @pytest.mark.asyncio
+    async def test_notify_cb_coerces_non_string_description(self):
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {"approval_delegate": "slack:C0B8JK868SX"}
+        maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        from tools import approval as mod
+        cb = mod._gateway_notify_cbs[self.SESSION_KEY]
+        await asyncio.to_thread(cb, {"command": "ls", "description": {"reason": "odd"}})
+
+        assert isinstance(adapter.approval_calls[0]["description"], str)
 
     @pytest.mark.asyncio
     async def test_buttonless_adapter_refuses_registration(self):

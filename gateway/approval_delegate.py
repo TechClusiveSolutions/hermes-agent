@@ -137,6 +137,28 @@ def _resolve_delegate_timeout(route_config: dict, global_approvals: dict) -> Opt
     return timeout
 
 
+def _resolve_delegate_metadata(route_config: dict, global_approvals: dict) -> Optional[dict]:
+    """Optional adapter metadata forwarded verbatim to ``send_exec_approval``.
+
+    Per-route ``approval_delegate_metadata`` wins; else the global
+    ``approvals.delegate_metadata`` default. Some adapters route sends
+    through metadata — notably Slack's multi-workspace installs select the
+    workspace-scoped client via ``metadata.team_id`` — and without it a
+    delegated prompt would go out on the primary workspace's token and fail
+    (fail-closed, but silently inert). Non-dict values are malformed config
+    and ignored.
+    """
+    value = route_config.get("approval_delegate_metadata")
+    if value is None:
+        value = global_approvals.get("delegate_metadata")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        logger.warning("Ignoring non-dict approval delegate metadata: %r", value)
+        return None
+    return value
+
+
 def _get_delegate_adapter(
     gateway_runner: Any, platform_name: str, profile: Optional[str] = None,
 ) -> Any:
@@ -251,6 +273,8 @@ def maybe_register_delegate(
         )
         return False
 
+    metadata = _resolve_delegate_metadata(route_config, global_approvals)
+
     def _delegate_notify_sync(approval_data: dict) -> None:
         """Bridge sync agent thread → event loop, targeting the delegate
         adapter/chat instead of the session's own originating adapter/chat.
@@ -263,7 +287,7 @@ def maybe_register_delegate(
         from agent.redact import redact_sensitive_text
 
         cmd = redact_sensitive_text(str(approval_data.get("command", "") or ""), force=True)
-        desc = approval_data.get("description", "dangerous command")
+        desc = str(approval_data.get("description") or "dangerous command")
 
         try:
             fut = safe_schedule_threadsafe(
@@ -272,6 +296,9 @@ def maybe_register_delegate(
                     command=cmd,
                     session_key=session_key,
                     description=desc,
+                    # Routes multi-workspace adapters (e.g. Slack team_id) to
+                    # the right scoped client; None for single-workspace.
+                    metadata=metadata,
                     # Never offer "Always Allow" on a delegated prompt: it
                     # writes a disk-persisted, process-global allowlist entry,
                     # and the human approving out-of-band has no visibility
