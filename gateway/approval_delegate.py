@@ -9,18 +9,25 @@ to say yes.
 
 This module lets an operator opt a headless session into forwarding those
 prompts to a real interactive platform (e.g. Slack) and having a human
-resolve them there, through that platform's own existing approve/deny
-mechanism (button-based ``send_exec_approval`` where the adapter supports
-it, else the existing plain-text fallback) — the same mechanism already used
-for native chat sessions on that platform. No platform-specific resolver
-code is added: adapters resolve an inbound approval reply generically by
-whatever ``session_key`` was embedded at send time, regardless of where that
+resolve them there, through that platform's own existing **button-based**
+``send_exec_approval`` mechanism — the same one already used for native chat
+sessions on that platform. No platform-specific resolver code is added:
+adapters resolve a button click generically by whatever ``session_key`` was
+embedded in the button payload at send time, regardless of where that
 session originated (confirmed for Slack's adapter, which treats
 ``session_key`` as an opaque pass-through both when rendering the approval
 buttons and when resolving a click against
 ``tools.approval.resolve_gateway_approval``).
 
-Two details matter for correctness and are easy to get wrong:
+Delegation is **button-only by design**. A plain-text ``/approve`` reply in
+the delegate chat is resolved against that chat's *own* session key — it
+cannot reach the headless session's approval, and could even resolve an
+unrelated approval already pending in that chat. So an adapter without
+``send_exec_approval`` gets a loud log and a no-op (fail-closed), not a
+broken text prompt. Text-based cross-session resolution would need its own
+explicit token/command design and is deliberately out of scope here.
+
+Three details matter for correctness and are easy to get wrong:
 
 1. **The session_key must be the real gateway approval key**, i.e. whatever
    ``gateway.session.build_session_key(source, ...)`` computes for the
@@ -35,13 +42,26 @@ Two details matter for correctness and are easy to get wrong:
    a caller like ``gateway/platforms/webhook.py`` registers a delegate.
    Without pinning, that later unpinned call silently overwrites the
    delegate — no exception, the feature just quietly does nothing.
+3. **"Always Allow" is never offered on a delegated prompt**
+   (``allow_permanent=False``, unconditionally). A permanent approval writes
+   a disk-persisted, process-global allowlist entry, and a human approving
+   out-of-band has no visibility into what future webhook payloads that
+   pattern would then auto-approve. Session scope is the ceiling.
 
 Fail-closed behavior is unchanged in every case this module doesn't
 actively improve: no delegate configured, a malformed target, an
-unconnected/unknown platform, or a delivery failure all leave the session
-behaving exactly as it does today (denied after the approval timeout). This
-module only ever adds a chance for a human to say yes — it never loosens
-the Smart DENY classifier, and it never bypasses the target platform's own
+unconnected/unknown platform, a button-less adapter, or a delivery failure
+all leave the session behaving exactly as it does today (denied after the
+approval timeout).
+
+Be precise about what this changes: the Smart DENY classifier's *logic* is
+untouched — outright-dangerous commands are still auto-denied with no human
+in the loop — but for the *ambiguous* bucket (which can include
+dangerous-looking commands the classifier couldn't condemn outright), the
+outcome genuinely changes from "guaranteed timeout-deny" to
+"human-approvable via one click in the delegate chat." That is the point of
+the feature, and operators opting in should understand they are granting
+that bucket a real approval path, gated by the delegate platform's own
 inbound authorization (SECURITY.md §2.6: a session_key is a routing handle,
 not an authorization boundary — the delegate relies entirely on the target
 adapter's existing authorization check, which runs before approval
@@ -65,9 +85,11 @@ def _parse_delegate_target(target: Optional[str]) -> Optional[Tuple[str, str]]:
     """Split ``"slack:C0B8JK868SX"`` into ``("slack", "C0B8JK868SX")``.
 
     Returns None if *target* isn't in ``<platform>:<chat-or-channel-id>``
-    form.
+    form. Non-string values (a YAML ``true``, a bare number, …) are malformed
+    config, not an exception path — they must fail closed like any other bad
+    target, never turn a webhook request into a TypeError.
     """
-    if not target or ":" not in target:
+    if not isinstance(target, str) or not target or ":" not in target:
         return None
     platform_name, _, chat_id = target.partition(":")
     platform_name = platform_name.strip().lower()
@@ -115,14 +137,18 @@ def _resolve_delegate_timeout(route_config: dict, global_approvals: dict) -> Opt
     return timeout
 
 
-def _get_delegate_adapter(gateway_runner: Any, platform_name: str) -> Any:
+def _get_delegate_adapter(
+    gateway_runner: Any, platform_name: str, profile: Optional[str] = None,
+) -> Any:
     """Look up a live adapter instance for *platform_name*.
 
-    Mirrors ``WebhookAdapter._deliver_cross_platform``'s adapter lookup
-    (default adapters first, falling back to per-profile adapters) so a
-    delegate target resolves the same way a webhook ``deliver:`` target
-    already does — deliberately reusing that lookup shape rather than
-    inventing a second one.
+    Profile-scoped, unlike ``WebhookAdapter._deliver_cross_platform``'s
+    scan-everything lookup: a session stamped with a secondary *profile*
+    resolves ONLY within that profile's adapter map, and an unstamped
+    session resolves ONLY among the default adapters. Falling back to some
+    other profile's bot would send the approval prompt through the wrong
+    workspace/account — for an approval surface that's a fail-closed
+    situation, not a convenience fallback.
     """
     from gateway.config import Platform
 
@@ -131,16 +157,13 @@ def _get_delegate_adapter(gateway_runner: Any, platform_name: str) -> Any:
     except ValueError:
         return None
 
-    adapter = gateway_runner.adapters.get(target_platform)
-    if adapter is not None:
-        return adapter
-    for amap in (getattr(gateway_runner, "_profile_adapters", None) or {}).values():
-        if not isinstance(amap, dict):
-            continue
-        candidate = amap.get(target_platform)
-        if candidate is not None:
-            return candidate
-    return None
+    if profile:
+        profile_adapters = getattr(gateway_runner, "_profile_adapters", None) or {}
+        amap = profile_adapters.get(profile)
+        if isinstance(amap, dict):
+            return amap.get(target_platform)
+        return None
+    return gateway_runner.adapters.get(target_platform)
 
 
 def maybe_register_delegate(
@@ -148,6 +171,7 @@ def maybe_register_delegate(
     route_config: dict,
     gateway_runner: Any,
     global_approvals: Optional[dict] = None,
+    profile: Optional[str] = None,
 ) -> bool:
     """Register an approval delegate for *session_key* if one is configured.
 
@@ -189,11 +213,30 @@ def maybe_register_delegate(
         )
         return False
 
-    adapter = _get_delegate_adapter(gateway_runner, platform_name)
+    adapter = _get_delegate_adapter(gateway_runner, platform_name, profile=profile)
     if adapter is None:
         logger.warning(
             "approval_delegate=%r configured for session %s but platform %r "
             "is not connected — ignoring, falling back to default fail-closed behavior",
+            target, session_key, platform_name,
+        )
+        return False
+
+    # Delegation requires the target adapter's button-based send_exec_approval.
+    # A plain-text prompt cannot work here: a typed /approve reply in the
+    # delegate chat resolves against THAT chat's own session key, not the
+    # headless session registered under *session_key* — only the button
+    # payload carries the original session_key back to
+    # resolve_gateway_approval. Worse, a well-meaning typed reply could
+    # resolve an unrelated approval already pending in the delegate chat.
+    # So: no buttons → honest no-op, fail closed, loud log. (Class-level
+    # check, not instance — avoids MagicMock false positives in tests.)
+    if getattr(type(adapter), "send_exec_approval", None) is None:
+        logger.warning(
+            "approval_delegate=%r configured for session %s but platform %r's "
+            "adapter has no button-based send_exec_approval — text replies "
+            "cannot resolve a delegated session's approval, so delegation is "
+            "disabled for this session (fail-closed behavior unchanged)",
             target, session_key, platform_name,
         )
         return False
@@ -211,75 +254,60 @@ def maybe_register_delegate(
     def _delegate_notify_sync(approval_data: dict) -> None:
         """Bridge sync agent thread → event loop, targeting the delegate
         adapter/chat instead of the session's own originating adapter/chat.
-        Mirrors gateway/run.py's native ``_approval_notify_sync``.
+        Mirrors gateway/run.py's native ``_approval_notify_sync``, minus its
+        text fallback: only the button payload carries *session_key* back to
+        ``resolve_gateway_approval``, so if the button send fails there is
+        nothing useful to say in text — log loudly and let the approval time
+        out to its normal fail-closed denial.
         """
         from agent.redact import redact_sensitive_text
-        from gateway.run import _format_exec_approval_fallback
 
         cmd = redact_sensitive_text(str(approval_data.get("command", "") or ""), force=True)
         desc = approval_data.get("description", "dangerous command")
 
-        # Prefer button-based approval when the delegate adapter supports it.
-        # Check the *class* for the method, not the instance — avoids false
-        # positives from MagicMock auto-attribute creation in tests.
-        if getattr(type(adapter), "send_exec_approval", None) is not None:
-            try:
-                fut = safe_schedule_threadsafe(
-                    adapter.send_exec_approval(
-                        chat_id=chat_id,
-                        command=cmd,
-                        session_key=session_key,
-                        description=desc,
-                        allow_permanent=approval_data.get("allow_permanent", True),
-                        allow_session=approval_data.get("allow_session", True),
-                        smart_denied=approval_data.get("smart_denied", False),
-                    ),
-                    loop,
-                    logger=logger,
-                    log_message="Delegated send_exec_approval scheduling error",
-                )
-                if fut is None:
-                    raise RuntimeError("send_exec_approval: loop unavailable")
-                try:
-                    result = fut.result(timeout=15)
-                except Exception:
-                    # Cancel the still-scheduled coroutine before falling back
-                    # to text — otherwise a slow button send can complete
-                    # *after* the fallback, delivering duplicate prompts
-                    # (buttons + text) for the same command. cancel() is a
-                    # no-op if the future already finished/failed.
-                    fut.cancel()
-                    raise
-                if result.success:
-                    return
-                logger.warning(
-                    "Delegated button-based approval failed (send returned error), "
-                    "falling back to text: %s",
-                    result.error,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Delegated button-based approval failed, falling back to text: %s", exc
-                )
-
-        prefix = getattr(adapter, "typed_command_prefix", "/")
-        msg = _format_exec_approval_fallback(
-            cmd, desc, prefix,
-            allow_permanent=approval_data.get("allow_permanent", True),
-            allow_session=approval_data.get("allow_session", True),
-            smart_denied=approval_data.get("smart_denied", False),
-        )
         try:
-            send_fut = safe_schedule_threadsafe(
-                adapter.send(chat_id, msg),
+            fut = safe_schedule_threadsafe(
+                adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=cmd,
+                    session_key=session_key,
+                    description=desc,
+                    # Never offer "Always Allow" on a delegated prompt: it
+                    # writes a disk-persisted, process-global allowlist entry,
+                    # and the human approving out-of-band has no visibility
+                    # into what future webhook payloads that pattern would
+                    # then auto-approve. Session scope is the ceiling here.
+                    allow_permanent=False,
+                    allow_session=approval_data.get("allow_session", True),
+                    smart_denied=approval_data.get("smart_denied", False),
+                ),
                 loop,
                 logger=logger,
-                log_message="Delegated approval text-send scheduling error",
+                log_message="Delegated send_exec_approval scheduling error",
             )
-            if send_fut is not None:
-                send_fut.result(timeout=15)
+            if fut is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            try:
+                result = fut.result(timeout=15)
+            except Exception:
+                # Cancel the still-scheduled coroutine so a slow send can't
+                # land a late, orphaned prompt after we've given up on it.
+                # cancel() is a no-op if the future already finished/failed.
+                fut.cancel()
+                raise
+            if not result.success:
+                logger.error(
+                    "Delegated approval prompt could not be delivered to %s "
+                    "(send returned error: %s) — approval will time out and "
+                    "fail closed for session %s",
+                    target, result.error, session_key,
+                )
         except Exception as exc:
-            logger.error("Failed to send delegated approval request: %s", exc)
+            logger.error(
+                "Delegated approval prompt could not be delivered to %s (%s) — "
+                "approval will time out and fail closed for session %s",
+                target, exc, session_key,
+            )
 
     from tools.approval import register_gateway_notify
 

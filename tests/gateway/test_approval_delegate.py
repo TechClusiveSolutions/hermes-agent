@@ -47,7 +47,9 @@ class _FakeButtonAdapter:
 
 
 class _FakeTextOnlyAdapter:
-    """Adapter stub with no send_exec_approval — exercises the text fallback."""
+    """Adapter stub with no send_exec_approval — delegation must refuse it
+    (button-only by design; a text /approve reply can't resolve a foreign
+    session_key)."""
 
     typed_command_prefix = "!"
 
@@ -90,6 +92,15 @@ class TestParseDelegateTarget:
 
     def test_none_is_malformed(self):
         assert _parse_delegate_target(None) is None
+
+    def test_non_string_values_are_malformed_not_exceptions(self):
+        """YAML `approval_delegate: true` / `123` must fail closed as
+        malformed config, never raise a TypeError into the webhook request
+        path (independent review finding #3)."""
+        assert _parse_delegate_target(True) is None
+        assert _parse_delegate_target(123) is None
+        assert _parse_delegate_target(["slack:C123"]) is None
+        assert _parse_delegate_target({"platform": "slack"}) is None
 
 
 class TestResolveDelegateTarget:
@@ -151,10 +162,28 @@ class TestGetDelegateAdapter:
         runner = _FakeRunner(adapters={Platform.SLACK: adapter})
         assert _get_delegate_adapter(runner, "slack") is adapter
 
-    def test_falls_back_to_profile_adapters(self):
+    def test_profile_scoped_lookup_finds_that_profiles_adapter(self):
         adapter = _FakeButtonAdapter()
         runner = _FakeRunner(profile_adapters={"work": {Platform.SLACK: adapter}})
-        assert _get_delegate_adapter(runner, "slack") is adapter
+        assert _get_delegate_adapter(runner, "slack", profile="work") is adapter
+
+    def test_unstamped_session_never_borrows_a_profiles_adapter(self):
+        """No profile → default adapters only. Resolving through some other
+        profile's bot would send the approval prompt via the wrong
+        workspace/account (independent review finding #2)."""
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(profile_adapters={"work": {Platform.SLACK: adapter}})
+        assert _get_delegate_adapter(runner, "slack") is None
+
+    def test_profile_session_never_borrows_default_adapter(self):
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        assert _get_delegate_adapter(runner, "slack", profile="work") is None
+
+    def test_profile_session_never_borrows_another_profiles_adapter(self):
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(profile_adapters={"work": {Platform.SLACK: adapter}})
+        assert _get_delegate_adapter(runner, "slack", profile="home") is None
 
     def test_unconnected_platform_returns_none(self):
         runner = _FakeRunner(adapters={})
@@ -304,28 +333,50 @@ class TestMaybeRegisterDelegateSuccess:
         assert call["chat_id"] == "C0B8JK868SX"
         assert call["session_key"] == self.SESSION_KEY
         assert call["command"] == "rm -rf /tmp/foo"
-        assert not adapter.text_calls  # button path succeeded, no fallback
+        assert not adapter.text_calls  # button-only: no text send, ever
 
     @pytest.mark.asyncio
-    async def test_notify_cb_falls_back_to_text_when_adapter_has_no_button_support(self):
-        adapter = _FakeTextOnlyAdapter()
+    async def test_notify_cb_never_offers_always_allow(self):
+        """allow_permanent must be forced False for delegated prompts — a
+        human approving out-of-band must not be able to write a permanent,
+        process-global allowlist entry (independent review finding #5)."""
+        adapter = _FakeButtonAdapter()
         runner = _FakeRunner(adapters={Platform.SLACK: adapter})
         route_config = {"approval_delegate": "slack:C0B8JK868SX"}
         maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
 
         from tools import approval as mod
         cb = mod._gateway_notify_cbs[self.SESSION_KEY]
-        await asyncio.to_thread(cb, {"command": "rm -rf /tmp/foo", "description": "cleanup"})
+        await asyncio.to_thread(
+            cb,
+            # Even when the approval data itself says permanent is allowed.
+            {"command": "rm -rf /tmp/foo", "description": "cleanup", "allow_permanent": True},
+        )
 
-        assert len(adapter.text_calls) == 1
-        chat_id, message, _metadata = adapter.text_calls[0]
-        assert chat_id == "C0B8JK868SX"
-        assert "rm -rf /tmp/foo" in message
-        # Uses the adapter's own typed_command_prefix ("!"), not a hardcoded "/".
-        assert "!approve" in message
+        assert adapter.approval_calls[0]["allow_permanent"] is False
 
     @pytest.mark.asyncio
-    async def test_notify_cb_falls_back_to_text_when_button_send_fails(self):
+    async def test_buttonless_adapter_refuses_registration(self):
+        """Button-only by design: a text /approve reply resolves the delegate
+        chat's own session, not the headless one — so a buttonless adapter
+        must be a fail-closed no-op, not a broken text prompt (independent
+        review finding #1)."""
+        adapter = _FakeTextOnlyAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        route_config = {"approval_delegate": "slack:C0B8JK868SX"}
+
+        registered = maybe_register_delegate(self.SESSION_KEY, route_config, runner, {})
+
+        assert registered is False
+        from tools import approval as mod
+        assert self.SESSION_KEY not in mod._gateway_notify_cbs
+        assert not adapter.text_calls
+
+    @pytest.mark.asyncio
+    async def test_notify_cb_sends_nothing_further_when_button_send_fails(self):
+        """On button-send failure there is no text fallback (it couldn't
+        resolve the session anyway) — log and let the approval time out to
+        its normal fail-closed denial."""
         adapter = _FakeButtonAdapter(approval_success=False)
         runner = _FakeRunner(adapters={Platform.SLACK: adapter})
         route_config = {"approval_delegate": "slack:C0B8JK868SX"}
@@ -335,8 +386,18 @@ class TestMaybeRegisterDelegateSuccess:
         cb = mod._gateway_notify_cbs[self.SESSION_KEY]
         await asyncio.to_thread(cb, {"command": "rm -rf /tmp/foo", "description": "cleanup"})
 
-        assert len(adapter.approval_calls) == 1  # tried the button path first
-        assert len(adapter.text_calls) == 1       # then fell back to text
+        assert len(adapter.approval_calls) == 1  # button send attempted
+        assert not adapter.text_calls            # no text fallback
+
+    @pytest.mark.asyncio
+    async def test_non_string_route_target_is_noop_not_exception(self):
+        adapter = _FakeButtonAdapter()
+        runner = _FakeRunner(adapters={Platform.SLACK: adapter})
+        for bad in (True, 123):
+            registered = maybe_register_delegate(
+                self.SESSION_KEY, {"approval_delegate": bad}, runner, {},
+            )
+            assert registered is False
 
 
 # ---------------------------------------------------------------------------
