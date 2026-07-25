@@ -240,7 +240,16 @@ def maybe_register_delegate(
                 )
                 if fut is None:
                     raise RuntimeError("send_exec_approval: loop unavailable")
-                result = fut.result(timeout=15)
+                try:
+                    result = fut.result(timeout=15)
+                except Exception:
+                    # Cancel the still-scheduled coroutine before falling back
+                    # to text — otherwise a slow button send can complete
+                    # *after* the fallback, delivering duplicate prompts
+                    # (buttons + text) for the same command. cancel() is a
+                    # no-op if the future already finished/failed.
+                    fut.cancel()
+                    raise
                 if result.success:
                     return
                 logger.warning(
