@@ -2044,7 +2044,7 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 _gateway_notify_timeouts: dict[str, int] = {}  # session_key → per-session timeout override (seconds)
-_gateway_notify_pinned: set = set()          # session_keys whose notify_cb refuses unpinned overwrite
+_gateway_notify_pinned: set[str] = set()     # session_keys whose notify_cb refuses unpinned overwrite
 
 
 def register_gateway_notify(session_key: str, cb, *, timeout_override: Optional[int] = None,

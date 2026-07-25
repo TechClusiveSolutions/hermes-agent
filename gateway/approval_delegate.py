@@ -61,7 +61,7 @@ from agent.async_utils import safe_schedule_threadsafe
 logger = logging.getLogger(__name__)
 
 
-def _parse_delegate_target(target: str) -> Optional[Tuple[str, str]]:
+def _parse_delegate_target(target: Optional[str]) -> Optional[Tuple[str, str]]:
     """Split ``"slack:C0B8JK868SX"`` into ``("slack", "C0B8JK868SX")``.
 
     Returns None if *target* isn't in ``<platform>:<chat-or-channel-id>``
