@@ -826,6 +826,29 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+
+        # Opt-in: forward this session's ambiguous-command smart-mode
+        # approvals to a real interactive platform (e.g. Slack) instead of
+        # always failing closed after the timeout with nobody able to
+        # respond. No-op unless approval_delegate is configured (per-route
+        # here, or globally in approvals.delegate) — see
+        # gateway/approval_delegate.py for the full behavior/fail-closed
+        # guarantees.
+        #
+        # Registers under the runner's own profile-aware session-key
+        # resolution, NOT session_chat_id — that's the actual key
+        # tools.approval waits on. Must match byte-for-byte or the notify_cb
+        # registers under a key nothing ever looks up.
+        from gateway.approval_delegate import maybe_register_delegate
+        approval_session_key = self._resolve_approval_session_key(source)
+        maybe_register_delegate(
+            approval_session_key,
+            route_config,
+            self.gateway_runner,
+            self._get_global_approvals_config(profile=source.profile),
+            profile=source.profile,
+        )
+
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -884,6 +907,16 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
+        # Unregister any approval delegate registered for this session
+        # (gateway/approval_delegate.py). Safe to call unconditionally even
+        # if none was registered. Must happen before/alongside session close
+        # so a stale notify_cb never outlives its one-shot webhook session.
+        # Must use the same resolver used at registration time in
+        # _handle_webhook, NOT event.source.chat_id — see the registration
+        # call site for why.
+        from tools.approval import unregister_gateway_notify
+        unregister_gateway_notify(self._resolve_approval_session_key(event.source))
+
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
@@ -1283,6 +1316,59 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    def _resolve_approval_session_key(self, source) -> str:
+        """The session key ``tools.approval`` will actually wait on for this
+        source — resolved through the runner's own profile-aware path
+        (``_session_key_for_source`` → ``SessionStore._generate_session_key``,
+        which honors ``multiplex_profiles``/``source.profile``) whenever a
+        runner is attached, so a ``/p/<profile>/`` route registers under the
+        same key the live run uses. Falls back to the base
+        ``build_session_key`` derivation (legacy ``agent:main`` namespace)
+        when no runner is available, matching non-multiplexed behavior.
+        """
+        runner = self.gateway_runner
+        key_fn = getattr(runner, "_session_key_for_source", None) if runner else None
+        if key_fn is not None:
+            try:
+                key = key_fn(source)
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:
+                pass
+        from gateway.session import build_session_key
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    def _get_global_approvals_config(self, profile: Optional[str] = None) -> dict:
+        """Read the global ``approvals`` config block, e.g. for
+        ``approvals.delegate`` (see gateway/approval_delegate.py).
+
+        Mirrors the ``cfg.get("approvals")`` pattern used elsewhere in
+        ``gateway/run.py``. Never raises — returns ``{}`` on any failure so a
+        config read hiccup can never break webhook delivery, only silently
+        leave approval delegation unconfigured (its existing no-op/fail-closed
+        path).
+
+        When *profile* names a secondary multiplexed profile, the global
+        default is withheld (``{}`` is returned): ``_read_user_config`` reads
+        the active profile's config, and applying one profile's
+        ``approvals.delegate``/``headless_timeout_seconds`` to another
+        profile's route would leak configuration across profiles. Profile
+        routes must opt in per-route (``approval_delegate`` on the route)
+        instead — the fail-closed default.
+        """
+        if profile:
+            return {}
+        try:
+            cfg = self.gateway_runner._read_user_config() if self.gateway_runner else {}
+            approvals = cfg.get("approvals") if isinstance(cfg, dict) else None
+            return approvals if isinstance(approvals, dict) else {}
+        except Exception:
+            return {}
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict

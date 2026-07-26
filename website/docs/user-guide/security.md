@@ -58,6 +58,48 @@ The full set of keys:
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 
+### Approval Delegation for Headless Sessions {#approval-delegation-for-headless-sessions}
+
+Headless triggers — currently [webhook](./messaging/webhooks.md) sessions — have no interactive chat window for a human to answer an `approvals.mode: smart` prompt through. By default, that means an ambiguous command in a headless session just hangs for the approval `timeout` and then fails closed (denied) — nobody is ever asked. This is the safe default and requires no configuration.
+
+If you'd rather give a human a real chance to approve a headless session's ambiguous commands — instead of a guaranteed denial every time — you can opt a session into **approval delegation**: the pending-command prompt is forwarded to a real interactive platform (e.g. Slack) and resolved there through that platform's existing **button-based** approval mechanism (`send_exec_approval`) — the exact same one used for that platform's native chat sessions. Delegation is button-only: a typed `/approve` reply in the delegate chat resolves that chat's *own* session, not the headless one, so a delegate platform whose adapter has no button support is refused at registration time (logged, fail-closed) rather than given a text prompt that couldn't work. Two deliberate restrictions apply to delegated prompts: **"Always Allow" is never offered** (a human approving out-of-band has no visibility into future payloads a permanent allowlist entry would auto-approve — "Allow Session" is the ceiling), and the prompt is delivered only through an adapter belonging to the same profile as the route (multiplexed deployments never borrow another profile's bot).
+
+```yaml
+approvals:
+  delegate: "slack:C0B8JK868SX"        # optional global default delegate target
+  headless_timeout_seconds: 900        # optional global default: how long a delegated approval waits for a reply
+```
+
+| Key | Default | What it controls |
+|---|---|---|
+| `delegate` | *(unset)* | Global default delegate target, format `"<platform>:<chat-or-channel-id>"` (e.g. `"slack:C0B8JK868SX"`). Applies to any headless route that doesn't set its own delegate — **except multiplexed `/p/<profile>/` webhook routes**, which never read the global defaults (that would leak one profile's approvals config onto another's route) and must opt in per-route instead. |
+| `headless_timeout_seconds` | *(unset — falls back to `approvals.timeout`)* | Global default for how long a delegated approval waits for a human reply before falling back to fail-closed denial. A human responding via a delegate platform typically needs longer than the ordinary `approvals.timeout` (300s default) — pushes may not be seen for a couple of minutes. |
+| `delegate_metadata` | *(unset)* | Optional dict forwarded verbatim to the delegate adapter's `send_exec_approval`. Needed when the adapter routes sends via metadata — e.g. multi-workspace Slack installs select the workspace-scoped client from `team_id` (`delegate_metadata: {team_id: T0123ABC}`); without it, the prompt goes out on the primary workspace's token and delegation fails closed. Single-workspace installs don't need it. Same `/p/<profile>/` non-inheritance rule as the other keys (use per-route `approval_delegate_metadata`). |
+
+For webhooks specifically, both are also configurable **per route**, overriding the global default — see the `approval_delegate` / `approval_delegate_timeout_seconds` [route properties](./messaging/webhooks.md#configuring-routes):
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        github:
+          secret: "..."
+          approval_delegate: "slack:C0B8JK868SX"
+          approval_delegate_timeout_seconds: 900
+```
+
+**What delegation does *not* change**:
+
+- **Nothing is enabled by default.** No `delegate` configured (globally or per-route) means zero behavior change — the session fails closed after the timeout exactly as it always has.
+- **The Smart DENY classifier's logic is untouched — but the ambiguous bucket's *outcome* genuinely changes.** Commands the classifier condemns outright are still auto-denied with no human in the loop, delegate or no delegate. But the *ambiguous* bucket — which can include dangerous-*looking* commands the classifier couldn't condemn with certainty — changes from "guaranteed timeout-deny" to "human-approvable with one click in the delegate chat." That is the point of the feature, and you should opt in understanding it: you are granting that bucket a real approval path, gated by the delegate platform's own user authorization. If a command class worries you specifically, `approvals.deny` rules still block it unconditionally, before delegation is ever consulted.
+- **Fail-closed on exhaustion, always.** If delivery to the delegate platform fails, or nobody replies within the timeout, the command is denied — same outcome as having no delegate configured at all. Delegation adds a chance to succeed; it never adds a chance to bypass denial.
+- **Authorization is not bypassed.** A delegated approval is resolved through the target platform's own existing inbound authorization (allowlist / DM pairing) — the same check a native chat approval on that platform goes through. A session_key is a routing handle, not an authorization credential in itself: knowing it grants no special rights to an unauthorized user replying on the delegate platform.
+
+:::info
+Only a single delegate target is supported per session, with a fixed fail-closed timeout. An ordered multi-platform fallback chain (e.g. "try Slack, then Discord, then a file-based pre-approval check") and any variant that resolves an unanswered prompt as *approved* rather than denied are deliberately not supported — the latter would loosen the default-deny guarantee this feature is built to preserve. Both are open ideas for a possible future, separately-designed capability, not something to reach for via unsupported config values.
+:::
+
 ### YOLO Mode
 
 YOLO mode bypasses **all** dangerous command approval prompts for the current session. It can be activated three ways:
